@@ -1,202 +1,329 @@
-// src/main/java/com/example/copyrightscanner/CopyrightScannerApplication.java
-package com.example.copyrightscanner;
-
-import org.springframework.boot.SpringApplication;
-import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
-import java.io.IOException;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.UUID;
+import javax.servlet.http.HttpServletResponse;
+import java.io.*;
+import java.nio.file.*;
+import java.util.*;
+import java.util.concurrent.*;
 
-@SpringBootApplication
 @RestController
-public class CopyrightScannerApplication {
+@RequestMapping("/api/bulk-process")
+public class BulkVideoProcessorController {
 
-    public static void main(String[] args) {
-        SpringApplication.run(CopyrightScannerApplication.class, args);
-    }
-
-    private final String UPLOAD_DIR = "uploads/";
-    private final String PROCESSED_DIR = "processed/";
-
-    @PostMapping("/upload")
-    public String handleFileUpload(@RequestParam("file") MultipartFile file) {
+    private static final String TEMP_DIR = "temp_bulk_processing";
+    private static final int MAX_CONCURRENT_PROCESSES = 4; // Limit concurrent FFmpeg processes
+    private static final ExecutorService PROCESSING_POOL = Executors.newFixedThreadPool(MAX_CONCURRENT_PROCESSES);
+    
+    @PostMapping("/")
+    public ResponseEntity<Map<String, String>> processBulkVideos(
+            @RequestParam("files") MultipartFile[] files,
+            @RequestParam("silenceThreshold") float silenceThreshold,
+            @RequestParam("minDuration") int minDuration,
+            @RequestParam("removeSilence") boolean removeSilence,
+            @RequestParam("removeStatic") boolean removeStatic,
+            @RequestParam("autoPacing") boolean autoPacing,
+            @RequestParam("autoCrop") boolean autoCrop,
+            @RequestParam("stabilize") boolean stabilize,
+            @RequestParam("colorCorrect") boolean colorCorrect,
+            @RequestParam("autoVolume") boolean autoVolume,
+            @RequestParam("faceFocus") boolean faceFocus) {
+        
+        // Validate input
+        if (files == null || files.length == 0) {
+            return ResponseEntity.badRequest().body(Map.of("error", "No files uploaded"));
+        }
+        
+        if (files.length > 100) {
+            return ResponseEntity.badRequest().body(Map.of("error", "Maximum 100 files allowed"));
+        }
+        
+        // Create temp directory
+        Path tempDir = Paths.get(TEMP_DIR);
         try {
-            // Create upload directory if it doesn't exist
-            Files.createDirectories(Paths.get(UPLOAD_DIR));
-            
-            // Generate unique filename
-            String filename = UUID.randomUUID().toString() + "_" + file.getOriginalFilename();
-            Path path = Paths.get(UPLOAD_DIR + filename);
-            
-            // Save file
-            file.transferTo(path);
-            
-            return filename;
+            if (!Files.exists(tempDir)) {
+                Files.createDirectories(tempDir);
+            }
         } catch (IOException e) {
-            e.printStackTrace();
-            return "Error: " + e.getMessage();
+            return ResponseEntity.status(500).body(Map.of("error", "Could not create temp directory"));
         }
+        
+        // Prepare response with processing IDs
+        Map<String, String> response = new HashMap<>();
+        response.put("batchId", UUID.randomUUID().toString());
+        response.put("totalFiles", String.valueOf(files.length));
+        
+        // Start processing in background
+        PROCESSING_POOL.submit(() -> {
+            processFilesInBackground(
+                files, 
+                silenceThreshold,
+                minDuration,
+                removeSilence,
+                removeStatic,
+                autoPacing,
+                autoCrop,
+                stabilize,
+                colorCorrect,
+                autoVolume,
+                faceFocus
+            );
+        });
+        
+        return ResponseEntity.ok(response);
     }
-
-    @PostMapping("/scan")
-    public ScanResponse scanVideo(@RequestBody ScanRequest request) {
-        // In a real application, this would use FFmpeg and content recognition APIs
-        // Here we simulate the scanning process
+    
+    @GetMapping("/status/{batchId}")
+    public ResponseEntity<Map<String, Object>> getBatchStatus(@PathVariable String batchId) {
+        // In a real implementation, this would check the actual processing status
+        // For this demo, we'll return simulated progress
         
-        String filename = request.getFilename();
-        int sensitivity = request.getSensitivity();
-        String contentType = request.getContentType();
+        Map<String, Object> response = new HashMap<>();
+        response.put("batchId", batchId);
+        response.put("processed", 25);
+        response.put("success", 20);
+        response.put("failed", 5);
+        response.put("remaining", 75);
+        response.put("status", "processing");
         
-        // Simulate processing time
-        try {
-            Thread.sleep(2000);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
+        return ResponseEntity.ok(response);
+    }
+    
+    @GetMapping("/download/{batchId}")
+    public void downloadProcessedBatch(
+            @PathVariable String batchId,
+            HttpServletResponse response) throws IOException {
         
-        // Generate mock results
-        List<CopyrightDetection> detections = new ArrayList<>();
+        // In a real implementation, this would stream the processed files
+        // For this demo, we'll just return a sample file
         
-        // More detections with higher sensitivity
-        int detectionCount = sensitivity * 2 + (int)(Math.random() * 3);
+        response.setContentType("application/zip");
+        response.setHeader("Content-Disposition", "attachment; filename=processed_videos.zip");
         
-        for (int i = 0; i < detectionCount; i++) {
-            double start = Math.random() * 120; // up to 2 minutes
-            double duration = 5 + Math.random() * 10; // 5-15 seconds
-            String type = contentType.equals("all") ? 
-                new String[]{"music", "video", "logo"}[(int)(Math.random() * 3)] : 
-                contentType;
+        // Create a sample ZIP file in a real implementation
+        // For demo, we'll just send an empty response
+        response.getOutputStream().flush();
+    }
+    
+    private void processFilesInBackground(
+            MultipartFile[] files,
+            float silenceThreshold,
+            int minDuration,
+            boolean removeSilence,
+            boolean removeStatic,
+            boolean autoPacing,
+            boolean autoCrop,
+            boolean stabilize,
+            boolean colorCorrect,
+            boolean autoVolume,
+            boolean faceFocus) {
+        
+        // Process each file with limited concurrency
+        List<Future<Boolean>> futures = new ArrayList<>();
+        
+        for (int i = 0; i < files.length; i++) {
+            MultipartFile file = files[i];
+            int fileIndex = i;
             
-            String[] confidenceLevels = {"high", "medium", "low"};
-            String confidence = confidenceLevels[(int)(Math.random() * 3)];
-            
-            detections.add(new CopyrightDetection(
-                start,
-                start + duration,
-                confidence,
-                type,
-                getRandomMatch(type)
-            ));
+            futures.add(PROCESSING_POOL.submit(() -> {
+                try {
+                    return processSingleFile(
+                        file,
+                        fileIndex,
+                        silenceThreshold,
+                        minDuration,
+                        removeSilence,
+                        removeStatic,
+                        autoPacing,
+                        autoCrop,
+                        stabilize,
+                        colorCorrect,
+                        autoVolume,
+                        faceFocus
+                    );
+                } catch (Exception e) {
+                    System.err.println("Error processing file " + file.getOriginalFilename() + ": " + e.getMessage());
+                    return false;
+                }
+            }));
         }
         
-        return new ScanResponse(filename, detections);
+        // Wait for all tasks to complete (in a real app, you'd track progress)
+        for (Future<Boolean> future : futures) {
+            try {
+                future.get();
+            } catch (InterruptedException | ExecutionException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
     }
-
-    @PostMapping("/remove")
-    public ProcessResponse removeCopyright(@RequestBody ProcessRequest request) {
-        // In a real application, this would use FFmpeg to remove segments
-        // Here we simulate the process
+    
+    private boolean processSingleFile(
+            MultipartFile file,
+            int fileIndex,
+            float silenceThreshold,
+            int minDuration,
+            boolean removeSilence,
+            boolean removeStatic,
+            boolean autoPacing,
+            boolean autoCrop,
+            boolean stabilize,
+            boolean colorCorrect,
+            boolean autoVolume,
+            boolean faceFocus) throws IOException {
         
-        String filename = request.getFilename();
-        List<CopyrightDetection> segmentsToRemove = request.getSegments();
+        // Create unique filenames
+        String inputFilename = "input_" + fileIndex + "_" + UUID.randomUUID() + getFileExtension(file.getOriginalFilename());
+        String outputFilename = "output_" + fileIndex + "_" + UUID.randomUUID() + ".mp4";
+        Path inputPath = Paths.get(TEMP_DIR, inputFilename);
+        Path outputPath = Paths.get(TEMP_DIR, outputFilename);
         
-        // Simulate processing time
         try {
-            Thread.sleep(3000);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
+            // Save uploaded file
+            file.transferTo(inputPath.toFile());
+            
+            // Build FFmpeg command
+            String command = buildProcessingCommand(
+                inputPath.toString(),
+                outputPath.toString(),
+                silenceThreshold,
+                minDuration,
+                removeSilence,
+                removeStatic,
+                autoPacing,
+                autoCrop,
+                stabilize,
+                colorCorrect,
+                autoVolume,
+                faceFocus
+            );
+            
+            // Execute command with timeout
+            boolean success = executeCommandWithTimeout(command, 300); // 5 minute timeout
+            
+            if (success && Files.exists(outputPath)) {
+                // In a real app, you'd store the processed file
+                System.out.println("Successfully processed: " + file.getOriginalFilename());
+                return true;
+            } else {
+                System.err.println("Failed to process: " + file.getOriginalFilename());
+                return false;
+            }
+            
+        } finally {
+            // Clean up temp files
+            Files.deleteIfExists(inputPath);
+            Files.deleteIfExists(outputPath);
+        }
+    }
+    
+    private String buildProcessingCommand(
+            String inputPath,
+            String outputPath,
+            float silenceThreshold,
+            int minDuration,
+            boolean removeSilence,
+            boolean removeStatic,
+            boolean autoPacing,
+            boolean autoCrop,
+            boolean stabilize,
+            boolean colorCorrect,
+            boolean autoVolume,
+            boolean faceFocus) {
+        
+        StringBuilder cmd = new StringBuilder("ffmpeg -i ")
+            .append(escapePath(inputPath));
+        
+        // Audio processing
+        if (removeSilence) {
+            cmd.append(" -af \"silenceremove=start_periods=1:start_duration=1:start_threshold=-")
+               .append(silenceThreshold * 60)
+               .append("dB,areverse,silenceremove=start_periods=1:start_duration=1:start_threshold=-")
+               .append(silenceThreshold * 60)
+               .append("dB,areverse\"");
         }
         
-        // Generate output filename
-        String outputFilename = "cleaned_" + filename;
+        if (autoVolume) {
+            cmd.append(" -af \"loudnorm=I=-16:TP=-1.5:LRA=11\"");
+        }
         
-        return new ProcessResponse(outputFilename, "Copyright content removed successfully");
+        // Video processing
+        List<String> videoFilters = new ArrayList<>();
+        
+        if (stabilize) {
+            videoFilters.add("deshake");
+        }
+        
+        if (colorCorrect) {
+            videoFilters.add("colorbalance=rs=0.1:gs=0.1:bs=0.1");
+        }
+        
+        if (autoCrop) {
+            videoFilters.add("cropdetect=limit=0.1:round=2");
+        }
+        
+        if (faceFocus) {
+            videoFilters.add("zoompan=z='min(zoom+0.001,1.2)':d=25");
+        }
+        
+        if (removeStatic || autoPacing) {
+            videoFilters.add("select='gt(scene,0.1)',setpts=N/FRAME_RATE/TB");
+        }
+        
+        if (!videoFilters.isEmpty()) {
+            cmd.append(" -vf \"").append(String.join(",", videoFilters)).append("\"");
+        }
+        
+        // Minimum clip duration
+        cmd.append(" -min_seg_duration ").append(minDuration).append("000000");
+        
+        // Output settings
+        cmd.append(" -c:v libx264 -preset fast -crf 23 -c:a aac -strict experimental ")
+           .append(escapePath(outputPath));
+        
+        return cmd.toString();
     }
-
-    private String getRandomMatch(String type) {
-        switch (type) {
-            case "music":
-                return new String[]{"Popular Song", "Movie Soundtrack", "Commercial Jingle"}[(int)(Math.random() * 3)];
-            case "video":
-                return new String[]{"Movie Clip", "TV Show Segment", "Sports Highlight"}[(int)(Math.random() * 3)];
-            case "logo":
-                return new String[]{"Company Logo", "TV Network Watermark", "Sponsor Graphic"}[(int)(Math.random() * 3)];
-            default:
-                return "Copyrighted Content";
+    
+    private boolean executeCommandWithTimeout(String command, int timeoutSeconds) {
+        try {
+            Process process = Runtime.getRuntime().exec(command);
+            
+            Future<?> future = PROCESSING_POOL.submit(() -> {
+                try (BufferedReader errorReader = new BufferedReader(
+                        new InputStreamReader(process.getErrorStream()))) {
+                    String line;
+                    while ((line = errorReader.readLine()) != null) {
+                        System.out.println("[FFmpeg] " + line);
+                    }
+                    return process.waitFor();
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return -1;
+                } catch (IOException e) {
+                    return -1;
+                }
+            });
+            
+            try {
+                future.get(timeoutSeconds, TimeUnit.SECONDS);
+                return process.exitValue() == 0;
+            } catch (TimeoutException e) {
+                process.destroy();
+                future.cancel(true);
+                return false;
+            } catch (Exception e) {
+                return false;
+            }
+        } catch (IOException e) {
+            return false;
         }
     }
-}
-
-// Request/Response classes
-class ScanRequest {
-    private String filename;
-    private int sensitivity;
-    private String contentType;
     
-    // Getters and setters
-    public String getFilename() { return filename; }
-    public void setFilename(String filename) { this.filename = filename; }
-    public int getSensitivity() { return sensitivity; }
-    public void setSensitivity(int sensitivity) { this.sensitivity = sensitivity; }
-    public String getContentType() { return contentType; }
-    public void setContentType(String contentType) { this.contentType = contentType; }
-}
-
-class ScanResponse {
-    private String filename;
-    private List<CopyrightDetection> detections;
-    
-    public ScanResponse(String filename, List<CopyrightDetection> detections) {
-        this.filename = filename;
-        this.detections = detections;
+    private String escapePath(String path) {
+        return "\"" + path + "\"";
     }
     
-    // Getters
-    public String getFilename() { return filename; }
-    public List<CopyrightDetection> getDetections() { return detections; }
-}
-
-class CopyrightDetection {
-    private double startTime;
-    private double endTime;
-    private String confidence;
-    private String contentType;
-    private String matchedContent;
-    
-    public CopyrightDetection(double startTime, double endTime, String confidence, 
-                            String contentType, String matchedContent) {
-        this.startTime = startTime;
-        this.endTime = endTime;
-        this.confidence = confidence;
-        this.contentType = contentType;
-        this.matchedContent = matchedContent;
+    private String getFileExtension(String filename) {
+        return filename != null ? filename.substring(filename.lastIndexOf(".")) : ".mp4";
     }
-    
-    // Getters
-    public double getStartTime() { return startTime; }
-    public double getEndTime() { return endTime; }
-    public String getConfidence() { return confidence; }
-    public String getContentType() { return contentType; }
-    public String getMatchedContent() { return matchedContent; }
-}
-
-class ProcessRequest {
-    private String filename;
-    private List<CopyrightDetection> segments;
-    
-    // Getters and setters
-    public String getFilename() { return filename; }
-    public void setFilename(String filename) { this.filename = filename; }
-    public List<CopyrightDetection> getSegments() { return segments; }
-    public void setSegments(List<CopyrightDetection> segments) { this.segments = segments; }
-}
-
-class ProcessResponse {
-    private String filename;
-    private String message;
-    
-    public ProcessResponse(String filename, String message) {
-        this.filename = filename;
-        this.message = message;
-    }
-    
-    // Getters
-    public String getFilename() { return filename; }
-    public String getMessage() { return message; }
 }
